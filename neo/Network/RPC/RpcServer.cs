@@ -35,6 +35,7 @@ namespace Neo.Network.RPC
         private Wallet wallet;
         private IWebHost host;
         private Fixed8 maxGasInvoke;
+        public static int MAX_CLAIMS_AMOUNT = 50;
 
         public RpcServer(NeoSystem system, Wallet wallet = null, Fixed8 maxGasInvoke = default(Fixed8))
         {
@@ -140,6 +141,56 @@ namespace Neo.Network.RPC
         {
             switch (method)
             {
+                case "claimgas":
+                    if (wallet == null)
+                        throw new RpcException(-400, "Access denied.");
+                    using (Snapshot snapshot = Blockchain.Singleton.GetSnapshot())
+                    {
+                        if (snapshot.CalculateBonus(wallet.GetUnclaimedCoins().Select(p => p.Reference)) == Fixed8.Zero)
+                        {
+                            throw new RpcException(-100, "No gas to claim");
+                        }
+                        CoinReference[] claims = wallet.GetUnclaimedCoins().Select(p => p.Reference).ToArray();
+                        if (claims.Length == 0) throw new RpcException(-100, "No gas to claim");
+
+                        ClaimTransaction tx = new ClaimTransaction
+                        {
+                            Claims = claims.Take(MAX_CLAIMS_AMOUNT).ToArray(),
+                            Attributes = new TransactionAttribute[0],
+                            Inputs = new CoinReference[0],
+                            Outputs = new[]
+                            {
+                                new TransactionOutput
+                                {
+                                    AssetId = Blockchain.UtilityToken.Hash,
+                                    Value = snapshot.CalculateBonus(claims.Take(MAX_CLAIMS_AMOUNT)),
+                                    ScriptHash = _params.Count > 0 ? _params[0].AsString().ToScriptHash() : wallet.GetChangeAddress()
+                                }
+                            }
+
+                        };
+                        ContractParametersContext context;
+                        try
+                        {
+                            context = new ContractParametersContext(tx);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            throw new RpcException(-400, "Access denied");
+                        }
+                        wallet.Sign(context);
+                        if (context.Completed)
+                        {
+                            tx.Witnesses = context.GetWitnesses();
+                            wallet.ApplyTransaction(tx);
+                            system.LocalNode.Tell(new LocalNode.Relay { Inventory = tx });
+                            return tx.ToJson();
+                        }
+                        else
+                        {
+                            return context.ToJson();
+                        }
+                    }
                 case "dumpprivkey":
                     if (wallet == null)
                         throw new RpcException(-400, "Access denied");
@@ -533,6 +584,27 @@ namespace Neo.Network.RPC
                         {
                             return context.ToJson();
                         }
+                    }
+                case "showgas":
+                    using (Snapshot snapshot = Blockchain.Singleton.GetSnapshot())
+                    {
+                        uint height = snapshot.Height + 1;
+                        Fixed8 unavailable;
+
+                        try
+                        {
+                            unavailable = snapshot.CalculateBonus(wallet.FindUnspentCoins().Where(p => p.Output.AssetId.Equals(Blockchain.GoverningToken.Hash)).Select(p => p.Reference), height);
+                        }
+                        catch (Exception)
+                        {
+                            unavailable = Fixed8.Zero;
+                        }
+
+                        return new JObject
+                        {
+                            ["available"] = snapshot.CalculateBonus(wallet.GetUnclaimedCoins().Select(p => p.Reference)).ToString(),
+                            ["unavailable"] = unavailable.ToString()
+                        };
                     }
                 case "submitblock":
                     {
