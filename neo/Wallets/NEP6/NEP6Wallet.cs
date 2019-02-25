@@ -165,6 +165,8 @@ namespace Neo.Wallets.NEP6
 
         public KeyPair DecryptKey(string nep2key)
         {
+            if (password == null)
+                return null;
             return new KeyPair(GetPrivateKeyFromNEP2(nep2key, password, Scrypt.N, Scrypt.R, Scrypt.P));
         }
 
@@ -334,22 +336,25 @@ namespace Neo.Wallets.NEP6
             return account;
         }
 
-        internal void Lock()
+        internal override void Lock()
         {
             password = null;
+            foreach (NEP6Account account in accounts.Values)
+            {
+                account.RemoveKey();
+            }
         }
 
-        public static NEP6Wallet Migrate(WalletIndexer indexer, string path, string db3path, string password)
+        public static NEP6Wallet Migrate(WalletIndexer indexer, string path, string db3path, string password, uint second)
         {
-            using (UserWallet wallet_old = UserWallet.Open(indexer, db3path, password))
+            using (UserWallet wallet_old = UserWallet.Open(indexer, db3path))
             {
+                wallet_old.Unlock(password, second);
                 NEP6Wallet wallet_new = new NEP6Wallet(indexer, path, wallet_old.Name);
-                using (wallet_new.Unlock(password))
+                wallet_new.Unlock(password, second);
+                foreach (WalletAccount account in wallet_old.GetAccounts())
                 {
-                    foreach (WalletAccount account in wallet_old.GetAccounts())
-                    {
-                        wallet_new.CreateAccount(account.Contract, account.GetKey());
-                    }
+                    wallet_new.CreateAccount(account.Contract, account.GetKey());
                 }
                 return wallet_new;
             }
@@ -366,12 +371,11 @@ namespace Neo.Wallets.NEP6
             File.WriteAllText(path, wallet.ToString());
         }
 
-        public IDisposable Unlock(string password)
+        internal override void Unlock(string password)
         {
             if (!VerifyPassword(password))
                 throw new CryptographicException();
             this.password = password;
-            return new WalletLocker(this);
         }
 
         public override bool VerifyPassword(string password)
@@ -384,22 +388,7 @@ namespace Neo.Wallets.NEP6
                     account = accounts.Values.FirstOrDefault(p => p.HasKey);
                 }
                 if (account == null) return true;
-                if (account.Decrypted)
-                {
-                    return account.VerifyPassword(password);
-                }
-                else
-                {
-                    try
-                    {
-                        account.GetKey(password);
-                        return true;
-                    }
-                    catch (FormatException)
-                    {
-                        return false;
-                    }
-                }
+                return account.VerifyPassword(password);
             }
         }
 

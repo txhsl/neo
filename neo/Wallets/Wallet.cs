@@ -219,6 +219,7 @@ namespace Neo.Wallets
             Array.Clear(privateKey, 0, privateKey.Length);
             return account;
         }
+        internal abstract void Lock();
 
         public T MakeTransaction<T>(T tx, UInt160 from = null, UInt160 change_address = null, Fixed8 fee = default(Fixed8)) where T : Transaction
         {
@@ -391,10 +392,18 @@ namespace Neo.Wallets
                 WalletAccount account = GetAccount(scriptHash);
                 if (account?.HasKey != true) continue;
                 KeyPair key = account.GetKey();
+                if (key == null) continue;
                 byte[] signature = context.Verifiable.Sign(key);
                 fSuccess |= context.AddSignature(account.Contract, key.PublicKey, signature);
             }
             return fSuccess;
+        }
+
+        internal abstract void Unlock(string password);
+
+        public void Unlock(string password, uint second)
+        {
+            WalletLocker.Unlock(this, password, second);
         }
 
         public abstract bool VerifyPassword(string password);

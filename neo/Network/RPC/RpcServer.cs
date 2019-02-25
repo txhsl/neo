@@ -36,7 +36,10 @@ namespace Neo.Network.RPC
         private IWebHost host;
         private Fixed8 maxGasInvoke;
         private readonly NeoSystem system;
-
+        
+        public static int MAX_CLAIMS_AMOUNT = 50;
+        public static uint DEFAULT_UNLOCK_TIME = 15;
+        
         public RpcServer(NeoSystem system, Wallet wallet = null, Fixed8 maxGasInvoke = default(Fixed8))
         {
             this.system = system;
@@ -143,9 +146,59 @@ namespace Neo.Network.RPC
         {
             switch (method)
             {
+                case "claimgas":
+                    if (wallet == null || WalletLocker.Locked())
+                        throw new RpcException(-400, "Access denied.");
+                    using (Snapshot snapshot = Blockchain.Singleton.GetSnapshot())
+                    {
+                        if (snapshot.CalculateBonus(wallet.GetUnclaimedCoins().Select(p => p.Reference)) == Fixed8.Zero)
+                        {
+                            throw new RpcException(-100, "No gas to claim");
+                        }
+                        CoinReference[] claims = wallet.GetUnclaimedCoins().Select(p => p.Reference).ToArray();
+                        if (claims.Length == 0) throw new RpcException(-100, "No gas to claim");
+
+                        ClaimTransaction tx = new ClaimTransaction
+                        {
+                            Claims = claims.Take(MAX_CLAIMS_AMOUNT).ToArray(),
+                            Attributes = new TransactionAttribute[0],
+                            Inputs = new CoinReference[0],
+                            Outputs = new[]
+                            {
+                                new TransactionOutput
+                                {
+                                    AssetId = Blockchain.UtilityToken.Hash,
+                                    Value = snapshot.CalculateBonus(claims.Take(MAX_CLAIMS_AMOUNT)),
+                                    ScriptHash = _params.Count > 0 ? _params[0].AsString().ToScriptHash() : wallet.GetChangeAddress()
+                                }
+                            }
+
+                        };
+                        ContractParametersContext context;
+                        try
+                        {
+                            context = new ContractParametersContext(tx);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            throw new RpcException(-400, "Access denied");
+                        }
+                        wallet.Sign(context);
+                        if (context.Completed)
+                        {
+                            tx.Witnesses = context.GetWitnesses();
+                            wallet.ApplyTransaction(tx);
+                            system.LocalNode.Tell(new LocalNode.Relay { Inventory = tx });
+                            return tx.ToJson();
+                        }
+                        else
+                        {
+                            return context.ToJson();
+                        }
+                    }
                 case "dumpprivkey":
-                    if (Wallet == null)
-                        throw new RpcException(-400, "Access denied");
+                    if (wallet == null || WalletLocker.Locked())
+                        throw new RpcException(-400, "Access denied.");
                     else
                     {
                         UInt160 scriptHash = _params[0].AsString().ToScriptHash();
@@ -270,8 +323,8 @@ namespace Neo.Network.RPC
                         return contract?.ToJson() ?? throw new RpcException(-100, "Unknown contract");
                     }
                 case "getnewaddress":
-                    if (Wallet == null)
-                        throw new RpcException(-400, "Access denied");
+                    if (wallet == null || WalletLocker.Locked())
+                        throw new RpcException(-400, "Access denied.");
                     else
                     {
                         WalletAccount account = Wallet.CreateAccount();
@@ -427,9 +480,17 @@ namespace Neo.Network.RPC
                             account["watchonly"] = p.WatchOnly;
                             return account;
                         }).ToArray();
-                case "sendfrom":
-                    if (Wallet == null)
+                case "lockwallet":
+                    if (wallet == null)
                         throw new RpcException(-400, "Access denied");
+                    else
+                    {
+                        WalletLocker.Lock();
+                        return true;
+                    }
+                case "sendfrom":
+                    if (wallet == null || WalletLocker.Locked())
+                        throw new RpcException(-400, "Access denied.");
                     else
                     {
                         UIntBase assetId = UIntBase.Parse(_params[0].AsString());
@@ -469,8 +530,8 @@ namespace Neo.Network.RPC
                         }
                     }
                 case "sendmany":
-                    if (Wallet == null)
-                        throw new RpcException(-400, "Access denied");
+                    if (wallet == null || WalletLocker.Locked())
+                        throw new RpcException(-400, "Access denied.");
                     else
                     {
                         JArray to = (JArray)_params[0];
@@ -518,8 +579,8 @@ namespace Neo.Network.RPC
                         return GetRelayResult(reason);
                     }
                 case "sendtoaddress":
-                    if (Wallet == null)
-                        throw new RpcException(-400, "Access denied");
+                    if (wallet == null || WalletLocker.Locked())
+                        throw new RpcException(-400, "Access denied.");
                     else
                     {
                         UIntBase assetId = UIntBase.Parse(_params[0].AsString());
@@ -557,11 +618,50 @@ namespace Neo.Network.RPC
                             return context.ToJson();
                         }
                     }
+                case "showgas":
+                    using (Snapshot snapshot = Blockchain.Singleton.GetSnapshot())
+                    {
+                        uint height = snapshot.Height + 1;
+                        Fixed8 unavailable;
+
+                        try
+                        {
+                            unavailable = snapshot.CalculateBonus(wallet.FindUnspentCoins().Where(p => p.Output.AssetId.Equals(Blockchain.GoverningToken.Hash)).Select(p => p.Reference), height);
+                        }
+                        catch (Exception)
+                        {
+                            unavailable = Fixed8.Zero;
+                        }
+
+                        return new JObject
+                        {
+                            ["available"] = snapshot.CalculateBonus(wallet.GetUnclaimedCoins().Select(p => p.Reference)).ToString(),
+                            ["unavailable"] = unavailable.ToString()
+                        };
+                    }
                 case "submitblock":
                     {
                         Block block = _params[0].AsString().HexToBytes().AsSerializable<Block>();
                         RelayResultReason reason = system.Blockchain.Ask<RelayResultReason>(block).Result;
                         return GetRelayResult(reason);
+                    }
+                case "unlockwallet":
+                    if (wallet == null)
+                        throw new RpcException(-400, "Access denied");
+                    else
+                    {
+                        try
+                        {
+                            if (_params.Count > 1)
+                                WalletLocker.Unlock(wallet, _params[0].AsString(), uint.Parse(_params[1].AsString()));
+                            else
+                                WalletLocker.Unlock(wallet, _params[0].AsString(), DEFAULT_UNLOCK_TIME);
+                        }
+                        catch (FormatException)
+                        {
+                            throw new RpcException(-32602, "Invalid params");
+                        }
+                        return true;
                     }
                 case "validateaddress":
                     {
